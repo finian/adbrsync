@@ -105,8 +105,12 @@ adbrsync -a --info=progress2 --perf-report run.json device:/sdcard/ ./backup/
 
 The record holds per-phase wall times (scan, plan, checksum, transfer, delete),
 the negotiated device facts, a per-size-class breakdown of where transfer time
-went, a per-second completion timeline, and every raw per-file sample as
-`[size_bytes, duration_ms, start_ms]`.
+went, a throughput timeline sampled roughly every 250 ms, and every raw per-file
+sample as `[size_bytes, duration_ms, start_ms]`.
+
+Bytes are counted as they are written rather than when a file finishes, so both
+the timeline and `--info=progress2` keep moving through a multi-minute file
+instead of standing still and then jumping.
 
 The size classes are usually the first thing to read: they show throughput as a
 function of file size, which is where the difference between "bound by the link"

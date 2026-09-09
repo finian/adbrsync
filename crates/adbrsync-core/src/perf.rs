@@ -15,10 +15,10 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::plan::Plan;
 use crate::scan::RemoteScan;
-use crate::transfer::{Sample, TransferReport};
+use crate::transfer::{ProgressSample, Sample, TransferReport};
 
 /// Bumped whenever the shape below changes incompatibly.
-pub const SCHEMA: &str = "adbrsync.perf.v1";
+pub const SCHEMA: &str = "adbrsync.perf.v2";
 
 #[derive(Debug, Default, Serialize)]
 pub struct DeviceFacts {
@@ -112,12 +112,24 @@ pub struct SizeBucket {
     pub bytes_per_sec: f64,
 }
 
-/// Completed bytes and files per second of wall clock.
+/// Throughput over the life of the transfer.
+///
+/// Built by differencing periodic readings of the live counters. An earlier
+/// version bucketed files by the instant each one *finished*, which on a run of
+/// large files left most buckets empty and put a whole file's bytes into the one
+/// second it completed in — reporting spikes many times the real rate. Bytes are
+/// now counted as they are written, so these readings are the actual curve.
 #[derive(Debug, Default, Serialize)]
 pub struct Timeline {
-    pub bucket_seconds: u64,
+    pub sample_interval_ms: u64,
+    /// Milliseconds from the start of the transfer for each reading.
+    pub at_ms: Vec<u64>,
+    /// Bytes written since the previous reading.
     pub bytes: Vec<u64>,
+    /// Files completed since the previous reading.
     pub files: Vec<u64>,
+    /// Throughput across each interval.
+    pub bytes_per_sec: Vec<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,7 +223,7 @@ impl PerfReport {
             },
             transfer,
             size_buckets: bucketize(&report.samples),
-            timeline: timeline(&report.samples, report.elapsed),
+            timeline: timeline(&report.progress),
             errors: report
                 .errors
                 .iter()
@@ -295,22 +307,35 @@ fn bucketize(samples: &[Sample]) -> Vec<SizeBucket> {
         .collect()
 }
 
-/// Completions bucketed by the second in which each file finished.
-fn timeline(samples: &[Sample], elapsed: Duration) -> Timeline {
-    let seconds = elapsed.as_secs().max(1) as usize + 1;
-    let mut bytes = vec![0u64; seconds];
-    let mut files = vec![0u64; seconds];
-    for sample in samples {
-        let finished = (sample.start + sample.duration).as_secs() as usize;
-        let slot = finished.min(seconds - 1);
-        bytes[slot] += sample.size;
-        files[slot] += 1;
+/// Difference the counter readings into per-interval throughput.
+fn timeline(progress: &[ProgressSample]) -> Timeline {
+    let mut t = Timeline {
+        sample_interval_ms: 0,
+        ..Default::default()
+    };
+    let (mut prev_at, mut prev_bytes, mut prev_files) = (Duration::ZERO, 0u64, 0u64);
+    for sample in progress {
+        let span = sample.at.saturating_sub(prev_at);
+        if span.is_zero() {
+            continue;
+        }
+        let bytes = sample.bytes_done.saturating_sub(prev_bytes);
+        t.at_ms.push(sample.at.as_millis() as u64);
+        t.bytes.push(bytes);
+        t.files.push(sample.files_done.saturating_sub(prev_files));
+        t.bytes_per_sec.push(bytes as f64 / span.as_secs_f64());
+        prev_at = sample.at;
+        prev_bytes = sample.bytes_done;
+        prev_files = sample.files_done;
     }
-    Timeline {
-        bucket_seconds: 1,
-        bytes,
-        files,
-    }
+    // Report the interval actually observed rather than the one asked for.
+    t.sample_interval_ms = t
+        .at_ms
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .min()
+        .unwrap_or_else(|| t.at_ms.first().copied().unwrap_or(0));
+    t
 }
 
 #[cfg(test)]
@@ -356,23 +381,51 @@ mod tests {
         assert!((buckets[0].mean_ms - 20.0).abs() < 1e-9);
     }
 
-    #[test]
-    fn timeline_counts_a_file_in_the_second_it_finished() {
-        let samples = vec![
-            sample(100, 500, 0),    // finishes at 0.5 s
-            sample(200, 800, 1500), // finishes at 2.3 s
-        ];
-        let t = timeline(&samples, Duration::from_secs(3));
-        assert_eq!(t.bytes[0], 100);
-        assert_eq!(t.bytes[2], 200);
-        assert_eq!(t.files[0], 1);
-        assert_eq!(t.files[2], 1);
+    fn reading(at_ms: u64, bytes: u64, files: u64) -> ProgressSample {
+        ProgressSample {
+            at: Duration::from_millis(at_ms),
+            bytes_done: bytes,
+            files_done: files,
+        }
     }
 
     #[test]
-    fn timeline_never_indexes_past_its_end() {
-        let samples = vec![sample(1, 5_000, 9_000)];
-        let t = timeline(&samples, Duration::from_secs(2));
-        assert_eq!(t.bytes.iter().sum::<u64>(), 1);
+    fn timeline_differences_counter_readings() {
+        let t = timeline(&[
+            reading(250, 1_000, 0),
+            reading(500, 3_000, 1),
+            reading(750, 3_500, 1),
+        ]);
+        assert_eq!(t.at_ms, vec![250, 500, 750]);
+        assert_eq!(t.bytes, vec![1_000, 2_000, 500]);
+        assert_eq!(t.files, vec![0, 1, 0]);
+        // 2,000 bytes across 250 ms is 8,000 B/s.
+        assert!((t.bytes_per_sec[1] - 8_000.0).abs() < 1e-6);
+        assert_eq!(t.sample_interval_ms, 250);
+    }
+
+    #[test]
+    fn timeline_shows_a_stall_as_zero_not_as_a_spike() {
+        // A long file in flight: bytes keep arriving, no file completes.
+        let t = timeline(&[
+            reading(250, 5_000, 0),
+            reading(500, 5_000, 0),
+            reading(750, 10_000, 1),
+        ]);
+        assert_eq!(t.bytes, vec![5_000, 0, 5_000]);
+        assert_eq!(t.bytes_per_sec[1], 0.0);
+    }
+
+    #[test]
+    fn timeline_of_an_empty_run_is_empty() {
+        let t = timeline(&[]);
+        assert!(t.at_ms.is_empty());
+        assert_eq!(t.sample_interval_ms, 0);
+    }
+
+    #[test]
+    fn timeline_ignores_readings_with_no_elapsed_time() {
+        let t = timeline(&[reading(250, 100, 1), reading(250, 200, 2)]);
+        assert_eq!(t.at_ms, vec![250]);
     }
 }

@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use adb_proto::{AdbClient, DeviceSelector, SyncSession};
@@ -35,9 +37,22 @@ impl Default for TransferOptions {
 #[derive(Debug, Default)]
 pub struct Stats {
     pub files_done: AtomicU64,
-    pub bytes_done: AtomicU64,
+    /// Advanced as bytes are written, not when a file finishes.
+    pub bytes_done: Arc<AtomicU64>,
     pub files_total: AtomicU64,
     pub bytes_total: AtomicU64,
+}
+
+/// A reading of the live counters, taken while the transfer runs.
+///
+/// Sampling the counters is the only way to see throughput over time: a record
+/// of when each file *finished* says nothing about the seconds in between, and
+/// with large files those are nearly all of them.
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressSample {
+    pub at: Duration,
+    pub bytes_done: u64,
+    pub files_done: u64,
 }
 
 /// One completed file transfer, kept so a run can be analysed afterwards.
@@ -75,6 +90,8 @@ pub struct TransferReport {
     pub streams: usize,
     /// Every completed transfer, for offline analysis.
     pub samples: Vec<Sample>,
+    /// Counter readings taken during the run, in order.
+    pub progress: Vec<ProgressSample>,
 }
 
 impl TransferReport {
@@ -90,6 +107,7 @@ impl TransferReport {
             per_stream_rate: 0.0,
             streams: 0,
             samples: Vec::new(),
+            progress: Vec::new(),
         }
     }
 
@@ -176,6 +194,27 @@ pub async fn run(
 
     let stream_count = opts.streams.clamp(1, plan.transfers.len());
     let started = Instant::now();
+
+    // Sample the counters on a timer, so the report can show throughput over
+    // time rather than only where files happened to finish.
+    let progress_log: Arc<Mutex<Vec<ProgressSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sampler = {
+        let stats = Arc::clone(&stats);
+        let log = Arc::clone(&progress_log);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PROGRESS_SAMPLE_INTERVAL);
+            ticker.tick().await; // fires immediately; that is the zero reading
+            loop {
+                ticker.tick().await;
+                log.lock().expect("progress log").push(ProgressSample {
+                    at: started.elapsed(),
+                    bytes_done: stats.bytes_done.load(Ordering::Relaxed),
+                    files_done: stats.files_done.load(Ordering::Relaxed),
+                });
+            }
+        })
+    };
+
     let mut workers = Vec::with_capacity(stream_count);
 
     for _ in 0..stream_count {
@@ -200,7 +239,7 @@ pub async fn run(
                     break;
                 };
                 let began = Instant::now();
-                match fetch_one(&mut session, &item, &dest, preserve_mtime).await {
+                match fetch_one(&mut session, &item, &dest, preserve_mtime, &stats).await {
                     Ok(bytes) => {
                         result.samples.push(Sample {
                             size: bytes,
@@ -209,8 +248,8 @@ pub async fn run(
                         });
                         result.files += 1;
                         result.bytes += bytes;
+                        // Bytes are counted as they are written, not here.
                         stats.files_done.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes_done.fetch_add(bytes, Ordering::Relaxed);
                     }
                     Err(e) => {
                         // One unreadable file must not abandon the rest.
@@ -284,6 +323,14 @@ pub async fn run(
         });
     }
 
+    sampler.abort();
+    let mut progress = progress_log.lock().expect("progress log").clone();
+    progress.push(ProgressSample {
+        at: started.elapsed(),
+        bytes_done: stats.bytes_done.load(Ordering::Relaxed),
+        files_done: stats.files_done.load(Ordering::Relaxed),
+    });
+
     samples.sort_by_key(|s| s.start);
     let fit = measure_cost(&samples);
     Ok(TransferReport {
@@ -296,6 +343,7 @@ pub async fn run(
         per_stream_rate: fit.rate,
         streams: streams_started,
         samples,
+        progress,
     })
 }
 
@@ -357,6 +405,7 @@ async fn fetch_one(
     item: &TransferItem,
     dest: &Path,
     preserve_mtime: bool,
+    stats: &Arc<Stats>,
 ) -> Result<u64> {
     let final_path =
         safe_join(dest, &item.rel).ok_or_else(|| Error::UnsafePath(item.rel.clone()))?;
@@ -366,16 +415,22 @@ async fn fetch_one(
     fs::create_dir_all(parent).await?;
 
     let temp_path = temp_path_for(&final_path);
-    let mut file = fs::File::create(&temp_path).await?;
-    let outcome = session.recv(&item.remote, &mut file).await;
+    let file = fs::File::create(&temp_path).await?;
+    let mut counted = CountingWriter::new(file, Arc::clone(&stats.bytes_done));
+    let outcome = session.recv(&item.remote, &mut counted).await;
     let bytes = match outcome {
         Ok(bytes) => {
-            file.flush().await?;
-            drop(file);
+            counted.flush().await?;
+            drop(counted);
             bytes
         }
         Err(e) => {
-            drop(file);
+            // The partial file is discarded, so its bytes must leave the
+            // counter too or progress would run past the total.
+            stats
+                .bytes_done
+                .fetch_sub(counted.written(), Ordering::Relaxed);
+            drop(counted);
             let _ = fs::remove_file(&temp_path).await;
             return Err(e.into());
         }
@@ -392,6 +447,55 @@ async fn fetch_one(
         .map_err(|e| Error::Io(std::io::Error::other(e)))??;
     }
     Ok(bytes)
+}
+
+/// How often the live counters are sampled for the timeline.
+const PROGRESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Writer that adds each chunk to a counter as it lands.
+///
+/// Counting on completion instead would make both the progress display and the
+/// recorded timeline move in whole-file steps, which for multi-megabyte files
+/// means minutes of apparent stillness.
+struct CountingWriter<W> {
+    inner: W,
+    counter: Arc<AtomicU64>,
+    written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, counter: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            counter,
+            written: 0,
+        }
+    }
+
+    fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let written = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        self.counter.fetch_add(written as u64, Ordering::Relaxed);
+        self.written += written as u64;
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 fn temp_path_for(final_path: &Path) -> PathBuf {
@@ -575,6 +679,7 @@ mod tests {
             per_stream_rate: 1.0,
             streams: 8,
             samples: Vec::new(),
+            progress: Vec::new(),
         };
         // 80 files * 100 ms / 8 streams = 1 s of the 10 s wall clock.
         assert_eq!(report.fixed_wall_cost(), Some(Duration::from_secs(1)));
@@ -593,6 +698,7 @@ mod tests {
             per_stream_rate: 1.0,
             streams: 8,
             samples: Vec::new(),
+            progress: Vec::new(),
         };
         assert!(report.fixed_wall_cost().is_none());
         assert!(report.overhead_fraction().is_none());
