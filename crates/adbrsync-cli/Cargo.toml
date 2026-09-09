@@ -1,0 +1,18 @@
+[package]
+name = "adbrsync-cli"
+description = "rsync-compatible command line for adbrsync."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "adbrsync"
+path = "src/main.rs"
+
+[dependencies]
+adb-proto = { path = "../adb-proto" }
+adbrsync-core = { path = "../adbrsync-core" }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true

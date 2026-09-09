@@ -1,0 +1,15 @@
+[package]
+name = "adb-proto"
+description = "Client for the ADB server protocol: host services, sync, and shell v2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+sha2 = "0.10"

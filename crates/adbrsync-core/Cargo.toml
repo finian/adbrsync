@@ -1,0 +1,18 @@
+[package]
+name = "adbrsync-core"
+description = "Scan, plan and transfer engine for adbrsync."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adb-proto = { path = "../adb-proto" }
+tokio.workspace = true
+thiserror.workspace = true
+filetime.workspace = true
+walkdir.workspace = true
+globset.workspace = true
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
