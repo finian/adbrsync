@@ -84,6 +84,8 @@ pub struct TransferReport {
     /// only large files, time spent per file is dominated by bytes and the two
     /// cannot be told apart.
     pub per_file_fixed: Option<Duration>,
+    /// How many files, and up to what size, the estimate above was taken from.
+    pub fixed_basis: Option<(usize, u64)>,
     /// Sustained per-stream byte rate implied by the same fit.
     pub per_stream_rate: f64,
     /// Streams the transfer actually ran on.
@@ -104,6 +106,7 @@ impl TransferReport {
             elapsed: Duration::ZERO,
             stream_time: Duration::ZERO,
             per_file_fixed: None,
+            fixed_basis: None,
             per_stream_rate: 0.0,
             streams: 0,
             samples: Vec::new(),
@@ -340,6 +343,7 @@ pub async fn run(
         elapsed: started.elapsed(),
         stream_time: samples.iter().map(|s| s.duration).sum(),
         per_file_fixed: fit.fixed,
+        fixed_basis: fit.basis,
         per_stream_rate: fit.rate,
         streams: streams_started,
         samples,
@@ -519,10 +523,18 @@ fn temp_path_for(final_path: &Path) -> PathBuf {
 /// the fit happily reports seconds of "fixed cost" per file. Refusing to answer
 /// is better than answering confidently from data that cannot support it.
 fn measure_cost(samples: &[Sample]) -> CostModel {
-    /// Files at or below this size spend almost all their time on fixed cost.
-    const SMALL: u64 = 4096;
-    /// Below this many small files the median is too noisy to be worth quoting.
-    const MIN_SMALL_SAMPLES: usize = 20;
+    /// Below this many files the median is too noisy to be worth quoting.
+    const MIN_SAMPLES: usize = 20;
+    /// The estimate is taken from this share of the run's smallest files.
+    const SMALLEST_SHARE: usize = 10;
+    /// Refuse once byte time is this much of the observed duration: past it the
+    /// answer is a small difference between two large numbers, which is noise.
+    ///
+    /// This is what rules out a run with no spread in file size, whether the
+    /// files are all large or all tiny. With one size the measured rate already
+    /// contains the fixed cost, so subtracting byte time removes everything and
+    /// the two terms are not separately identifiable.
+    const MAX_BYTE_SHARE: f64 = 0.5;
 
     let stream_time: f64 = samples.iter().map(|s| s.duration.as_secs_f64()).sum();
     let bytes: u64 = samples.iter().map(|s| s.size).sum();
@@ -532,37 +544,65 @@ fn measure_cost(samples: &[Sample]) -> CostModel {
         0.0
     };
 
-    let mut small: Vec<Duration> = samples
-        .iter()
-        .filter(|s| s.size <= SMALL)
-        .map(|s| s.duration)
-        .collect();
-    if small.len() < MIN_SMALL_SAMPLES {
-        return CostModel { fixed: None, rate };
+    if samples.len() < MIN_SAMPLES || rate <= 0.0 {
+        return CostModel {
+            fixed: None,
+            basis: None,
+            rate,
+        };
     }
-    small.sort_unstable();
-    let median = small[small.len() / 2];
 
-    let mean_small_bytes = samples
-        .iter()
-        .filter(|s| s.size <= SMALL)
-        .map(|s| s.size)
-        .sum::<u64>() as f64
-        / small.len() as f64;
-    let byte_time = if rate > 0.0 {
-        Duration::from_secs_f64(mean_small_bytes / rate)
-    } else {
-        Duration::ZERO
-    };
+    // Work from the smallest files in the run rather than a fixed size cutoff:
+    // what counts as "small enough that bytes hardly matter" depends on how
+    // fast the link is, and a hard threshold silently refuses to answer on a
+    // corpus of, say, 8 KiB files that would have measured perfectly well.
+    //
+    // Select by a size *threshold* and keep every file at or under it. Taking a
+    // fixed count instead biases the sample whenever many files share the
+    // smallest size: the sort is stable, so the slice becomes "the ones that
+    // ran first", and those are exactly the ones that queued behind the large
+    // transfers still saturating the link. Measured on a real mixed run that
+    // mistake inflated the median from 13 ms to 788 ms.
+    let mut sizes: Vec<u64> = samples.iter().map(|s| s.size).collect();
+    sizes.sort_unstable();
+    let cut = (samples.len() / SMALLEST_SHARE)
+        .max(MIN_SAMPLES)
+        .min(sizes.len());
+    let threshold = sizes[cut - 1];
+    let group: Vec<&Sample> = samples.iter().filter(|s| s.size <= threshold).collect();
+    if group.len() < MIN_SAMPLES {
+        return CostModel {
+            fixed: None,
+            basis: None,
+            rate,
+        };
+    }
+
+    let mut durations: Vec<Duration> = group.iter().map(|s| s.duration).collect();
+    durations.sort_unstable();
+    let median = durations[durations.len() / 2];
+
+    let mean_bytes = group.iter().map(|s| s.size).sum::<u64>() as f64 / group.len() as f64;
+    let byte_time = mean_bytes / rate;
+    if byte_time > median.as_secs_f64() * MAX_BYTE_SHARE {
+        return CostModel {
+            fixed: None,
+            basis: None,
+            rate,
+        };
+    }
 
     CostModel {
-        fixed: Some(median.saturating_sub(byte_time)),
+        fixed: Some(median.saturating_sub(Duration::from_secs_f64(byte_time))),
+        basis: Some((group.len(), group.last().map(|s| s.size).unwrap_or(0))),
         rate,
     }
 }
 
 struct CostModel {
     fixed: Option<Duration>,
+    /// Number of files the estimate came from, and the largest of them.
+    basis: Option<(usize, u64)>,
     /// Bytes per second per stream.
     rate: f64,
 }
@@ -643,6 +683,22 @@ mod tests {
         let fixed = cost.fixed.expect("enough small files");
         // 100 ms less the negligible byte time of a 1 KiB file.
         assert!((fixed.as_secs_f64() - 0.1).abs() < 0.005, "{fixed:?}");
+        let (count, largest) = cost.basis.expect("basis reported");
+        assert!(count >= 20);
+        assert_eq!(largest, 1024);
+    }
+
+    #[test]
+    fn a_fixed_size_cutoff_does_not_gate_the_estimate() {
+        // 8 KiB files: far above the old hard-coded 4 KiB threshold, but still
+        // small enough relative to the rate for the estimate to hold.
+        let samples: Vec<Sample> = (0..40)
+            .map(|_| sample(8192, Duration::from_millis(40)))
+            .chain((1..=4).map(|mib: u64| sample(mib << 20, Duration::from_secs(mib))))
+            .collect();
+        let cost = measure_cost(&samples);
+        let fixed = cost.fixed.expect("8 KiB files are measurable");
+        assert!(fixed.as_secs_f64() > 0.03, "{fixed:?}");
     }
 
     #[test]
@@ -658,13 +714,41 @@ mod tests {
 
     #[test]
     fn refuses_to_guess_when_every_file_is_large() {
-        // Uniformly large files: fixed cost is not identifiable from them.
+        // Uniformly large files: nearly all of each duration is bytes, so what
+        // is left after subtracting them is noise rather than a measurement.
         let samples: Vec<Sample> = (1..=40)
             .map(|i: u64| sample(18 << 20, Duration::from_secs_f64(20.0 + i as f64 * 0.1)))
             .collect();
         let cost = measure_cost(&samples);
         assert!(cost.fixed.is_none());
+        assert!(cost.basis.is_none());
         assert!(cost.rate > 0.0);
+    }
+
+    #[test]
+    fn ties_at_the_smallest_size_do_not_bias_the_sample() {
+        // Many files share the smallest size. The ones transferred first ran
+        // while large files still saturated the link, so their durations are an
+        // order of magnitude worse. Selecting a fixed count from a stable sort
+        // would pick exactly those; selecting by size must keep them all.
+        let mut samples: Vec<Sample> = (0..70)
+            .map(|_| sample(4096, Duration::from_millis(788)))
+            .collect();
+        samples.extend((0..606).map(|_| sample(4096, Duration::from_millis(13))));
+        samples.extend((0..25).map(|_| sample(64 << 20, Duration::from_secs(30))));
+
+        let fixed = measure_cost(&samples).fixed.expect("measurable");
+        // The median across all 676 small files is 13 ms, not the 788 ms of the
+        // contended head of the run.
+        assert!(fixed.as_secs_f64() < 0.05, "{fixed:?}");
+    }
+
+    #[test]
+    fn refuses_when_there_are_too_few_files_to_be_sure() {
+        let samples: Vec<Sample> = (0..5)
+            .map(|_| sample(1024, Duration::from_millis(50)))
+            .collect();
+        assert!(measure_cost(&samples).fixed.is_none());
     }
 
     #[test]
@@ -676,6 +760,7 @@ mod tests {
             elapsed: Duration::from_secs(10),
             stream_time: Duration::from_secs(80),
             per_file_fixed: Some(Duration::from_millis(100)),
+            fixed_basis: None,
             per_stream_rate: 1.0,
             streams: 8,
             samples: Vec::new(),
@@ -695,6 +780,7 @@ mod tests {
             elapsed: Duration::from_secs(10),
             stream_time: Duration::from_secs(80),
             per_file_fixed: None,
+            fixed_basis: None,
             per_stream_rate: 1.0,
             streams: 8,
             samples: Vec::new(),

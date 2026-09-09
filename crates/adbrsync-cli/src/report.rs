@@ -93,11 +93,23 @@ impl Printer {
             );
             match (report.per_file_fixed, report.overhead_fraction()) {
                 (Some(fixed), Some(share)) => {
-                    println!("  per-file fixed    {:.1} ms", fixed.as_secs_f64() * 1000.0);
+                    let basis = match report.fixed_basis {
+                        Some((count, largest)) => format!(
+                            " (from {count} files up to {})",
+                            human_bytes(largest, self.human)
+                        ),
+                        None => String::new(),
+                    };
+                    println!(
+                        "  per-file fixed    {:.1} ms{basis}",
+                        fixed.as_secs_f64() * 1000.0
+                    );
                     println!("  fixed cost share  {:.1}% of wall time", share * 100.0);
                 }
                 _ => println!(
-                    "  per-file fixed    not measurable (too few files under 4 KiB in this run)"
+                    "  per-file fixed    not measurable \
+                     (needs a spread of file sizes in one run; with a single size the \
+                     fixed cost cannot be told apart from the bytes)"
                 ),
             }
         }

@@ -94,6 +94,9 @@ pub struct TransferFacts {
     pub per_stream_bytes_per_sec: f64,
     /// Null when the run held too few small files to measure it.
     pub per_file_fixed_ms: Option<f64>,
+    /// How many files, and up to what size, that estimate came from.
+    pub per_file_fixed_from_files: Option<usize>,
+    pub per_file_fixed_up_to_bytes: Option<u64>,
     pub fixed_cost_share: Option<f64>,
     pub failures: usize,
 }
@@ -199,6 +202,8 @@ impl PerfReport {
             aggregate_bytes_per_sec: report.throughput(),
             per_stream_bytes_per_sec: report.per_stream_rate,
             per_file_fixed_ms: report.per_file_fixed.map(|d| d.as_secs_f64() * 1000.0),
+            per_file_fixed_from_files: report.fixed_basis.map(|(n, _)| n),
+            per_file_fixed_up_to_bytes: report.fixed_basis.map(|(_, s)| s),
             fixed_cost_share: report.overhead_fraction(),
             failures: report.errors.len(),
         };
