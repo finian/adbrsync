@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -37,10 +37,52 @@ impl Default for TransferOptions {
 #[derive(Debug, Default)]
 pub struct Stats {
     pub files_done: AtomicU64,
-    /// Advanced as bytes are written, not when a file finishes.
+    /// Bytes read from the device, advanced as they arrive rather than when a
+    /// file finishes. A file bound for several destinations counts once here,
+    /// because the device link is what the progress display is about.
     pub bytes_done: Arc<AtomicU64>,
     pub files_total: AtomicU64,
     pub bytes_total: AtomicU64,
+    pub dests: Vec<DestStats>,
+}
+
+impl Stats {
+    pub fn new(destinations: usize) -> Self {
+        Self {
+            dests: (0..destinations).map(|_| DestStats::default()).collect(),
+            ..Default::default()
+        }
+    }
+}
+
+/// What one destination has actually received so far.
+#[derive(Debug, Default)]
+pub struct DestStats {
+    pub files: AtomicU64,
+    pub bytes: AtomicU64,
+    pub failures: AtomicU64,
+    /// Set once a destination has been written off. Later files skip it
+    /// silently rather than reporting the same broken drive thousands of times.
+    pub disabled: AtomicBool,
+}
+
+/// Failures on one destination before it is written off for the rest of the run.
+const DEST_FAILURE_LIMIT: u64 = 10;
+
+impl DestStats {
+    fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Record a failure; returns true if this is the one that gives up.
+    fn note_failure(&self) -> bool {
+        let count = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        count == DEST_FAILURE_LIMIT && !self.disabled.swap(true, Ordering::Relaxed)
+    }
+
+    pub fn disable(&self) {
+        self.disabled.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A reading of the live counters, taken while the transfer runs.
@@ -94,6 +136,17 @@ pub struct TransferReport {
     pub samples: Vec<Sample>,
     /// Counter readings taken during the run, in order.
     pub progress: Vec<ProgressSample>,
+    /// What each destination ended up with.
+    pub dests: Vec<DestOutcome>,
+}
+
+/// One destination's share of a finished run.
+#[derive(Debug, Clone, Default)]
+pub struct DestOutcome {
+    pub root: PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+    pub failures: usize,
 }
 
 impl TransferReport {
@@ -111,6 +164,7 @@ impl TransferReport {
             streams: 0,
             samples: Vec::new(),
             progress: Vec::new(),
+            dests: Vec::new(),
         }
     }
 
@@ -163,8 +217,33 @@ impl TransferReport {
     }
 }
 
-/// Create every directory the plan needs, before any transfer starts.
-pub async fn create_dirs(plan: &Plan, dest: &Path) -> Result<()> {
+/// Create every directory the plan needs, in every destination, before any
+/// transfer starts.
+///
+/// A destination that cannot be prepared — read-only, full, unplugged between
+/// the check and now — is reported and left out, not allowed to abort the run.
+/// Losing one drive should not cost you the copy on the other. Only when every
+/// destination fails is there nothing left to do.
+pub async fn create_dirs(plan: &Plan, dests: &[PathBuf]) -> Result<Vec<(usize, String)>> {
+    let mut failed = Vec::new();
+    for (i, dest) in dests.iter().enumerate() {
+        if let Err(e) = prepare_dest(plan, dest).await {
+            failed.push((i, e.to_string()));
+        }
+    }
+    if failed.len() == dests.len() {
+        let reason = failed
+            .first()
+            .map(|(_, e)| e.clone())
+            .unwrap_or_else(|| "no destinations".to_string());
+        return Err(Error::Io(std::io::Error::other(format!(
+            "no destination could be prepared: {reason}"
+        ))));
+    }
+    Ok(failed)
+}
+
+async fn prepare_dest(plan: &Plan, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).await?;
     for rel in &plan.dirs {
         let path = safe_join(dest, rel).ok_or_else(|| Error::UnsafePath(rel.clone()))?;
@@ -178,7 +257,7 @@ pub async fn run(
     client: &AdbClient,
     selector: &DeviceSelector,
     plan: &Plan,
-    dest: &Path,
+    dests: &[PathBuf],
     opts: &TransferOptions,
     stats: Arc<Stats>,
 ) -> Result<TransferReport> {
@@ -225,7 +304,7 @@ pub async fn run(
         let selector = selector.clone();
         let queue = Arc::clone(&queue);
         let stats = Arc::clone(&stats);
-        let dest = dest.to_path_buf();
+        let dests: Vec<PathBuf> = dests.to_vec();
         let preserve_mtime = opts.preserve_mtime;
         let origin = started;
 
@@ -238,12 +317,22 @@ pub async fn run(
             };
             let mut result = WorkerResult::default();
             loop {
+                if stats.dests.iter().all(DestStats::is_disabled) {
+                    break;
+                }
                 let Some(item) = queue.lock().expect("queue mutex").pop_front() else {
                     break;
                 };
                 let began = Instant::now();
-                match fetch_one(&mut session, &item, &dest, preserve_mtime, &stats).await {
-                    Ok(bytes) => {
+                match fetch_one(&mut session, &item, &dests, preserve_mtime, &stats).await {
+                    Ok(fetched) => {
+                        let bytes = fetched.bytes;
+                        for (target, message) in fetched.failed {
+                            result.errors.push(FileError {
+                                rel: format!("{} -> {}", item.rel, dests[target].display()),
+                                message,
+                            });
+                        }
                         result.samples.push(Sample {
                             size: bytes,
                             duration: began.elapsed(),
@@ -348,6 +437,16 @@ pub async fn run(
         streams: streams_started,
         samples,
         progress,
+        dests: dests
+            .iter()
+            .enumerate()
+            .map(|(i, root)| DestOutcome {
+                root: root.clone(),
+                files: stats.dests[i].files.load(Ordering::Relaxed),
+                bytes: stats.dests[i].bytes.load(Ordering::Relaxed),
+                failures: stats.dests[i].failures.load(Ordering::Relaxed) as usize,
+            })
+            .collect(),
     })
 }
 
@@ -402,75 +501,180 @@ async fn open_session(client: &AdbClient, selector: &DeviceSelector) -> Result<S
     Err(last.expect("at least one attempt"))
 }
 
-/// Pull one file to a temporary name and rename it into place, so an
-/// interrupted run never leaves a truncated file that looks complete.
+/// What one file's transfer produced.
+struct FetchOutcome {
+    /// Bytes read from the device, counted once however many destinations
+    /// received them.
+    bytes: u64,
+    /// Destinations that could not be written, by index into the destination
+    /// list, with the reason.
+    failed: Vec<(usize, String)>,
+}
+
+/// Pull one file and write it to every destination that needs it.
+///
+/// Each destination is written to a temporary name and renamed into place, so
+/// an interrupted run never leaves a truncated file that looks complete. A
+/// destination that fails does not take the others down with it — a full disk
+/// on one drive should not cost you the copy on the other.
 async fn fetch_one(
     session: &mut SyncSession,
     item: &TransferItem,
-    dest: &Path,
+    dests: &[PathBuf],
     preserve_mtime: bool,
     stats: &Arc<Stats>,
-) -> Result<u64> {
-    let final_path =
-        safe_join(dest, &item.rel).ok_or_else(|| Error::UnsafePath(item.rel.clone()))?;
-    let parent = final_path
-        .parent()
-        .ok_or_else(|| Error::UnsafePath(item.rel.clone()))?;
-    fs::create_dir_all(parent).await?;
+) -> Result<FetchOutcome> {
+    let mut targets: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+    let mut files: Vec<Option<fs::File>> = Vec::new();
+    let mut failed: Vec<(usize, String)> = Vec::new();
 
-    let temp_path = temp_path_for(&final_path);
-    let file = fs::File::create(&temp_path).await?;
-    let mut counted = CountingWriter::new(file, Arc::clone(&stats.bytes_done));
-    let outcome = session.recv(&item.remote, &mut counted).await;
-    let bytes = match outcome {
-        Ok(bytes) => {
-            counted.flush().await?;
-            drop(counted);
-            bytes
+    for &i in &item.targets {
+        if stats.dests[i].is_disabled() {
+            continue;
         }
-        Err(e) => {
-            // The partial file is discarded, so its bytes must leave the
-            // counter too or progress would run past the total.
-            stats
-                .bytes_done
-                .fetch_sub(counted.written(), Ordering::Relaxed);
-            drop(counted);
-            let _ = fs::remove_file(&temp_path).await;
-            return Err(e.into());
+        let Some(final_path) = safe_join(&dests[i], &item.rel) else {
+            failed.push((i, "refusing unsafe destination path".to_string()));
+            continue;
+        };
+        let Some(parent) = final_path.parent().map(Path::to_path_buf) else {
+            failed.push((i, "destination path has no parent".to_string()));
+            continue;
+        };
+        if let Err(e) = fs::create_dir_all(&parent).await {
+            failed.push((i, e.to_string()));
+            continue;
         }
-    };
-
-    fs::rename(&temp_path, &final_path).await?;
-    if preserve_mtime {
-        let path = final_path.clone();
-        let mtime = item.mtime;
-        tokio::task::spawn_blocking(move || {
-            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0))
-        })
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        let temp_path = temp_path_for(&final_path);
+        match fs::File::create(&temp_path).await {
+            Ok(file) => {
+                files.push(Some(file));
+                targets.push((i, final_path, temp_path));
+            }
+            Err(e) => failed.push((i, e.to_string())),
+        }
     }
-    Ok(bytes)
+
+    for (i, _) in &failed {
+        note_failure(stats, *i, &mut Vec::new());
+    }
+    if files.is_empty() {
+        if item.targets.iter().all(|i| stats.dests[*i].is_disabled()) {
+            // Everything this file was bound for has already been written off.
+            return Ok(FetchOutcome {
+                bytes: 0,
+                failed: Vec::new(),
+            });
+        }
+        return Err(Error::Io(std::io::Error::other(
+            "no destination could be opened for writing",
+        )));
+    }
+
+    let mut sink = Fanout::new(files, Arc::clone(&stats.bytes_done));
+    let received = session.recv(&item.remote, &mut sink).await;
+    if let Err(e) = received {
+        // The partial files are discarded, so their bytes must leave the
+        // counter too or progress would run past the total.
+        stats
+            .bytes_done
+            .fetch_sub(sink.written(), Ordering::Relaxed);
+        drop(sink);
+        for (_, _, temp_path) in &targets {
+            let _ = fs::remove_file(temp_path).await;
+        }
+        return Err(e.into());
+    }
+    let bytes = received.expect("checked above");
+
+    // A flush error only surfaces once every destination has failed; the
+    // per-destination reasons are collected by the sink either way.
+    let _ = sink.flush().await;
+    let (open, write_failures) = sink.finish();
+    let mut written_off = Vec::new();
+    for (pos, message) in write_failures {
+        let i = targets[pos].0;
+        failed.push((i, message));
+        note_failure(stats, i, &mut written_off);
+    }
+
+    for (pos, (i, final_path, temp_path)) in targets.iter().enumerate() {
+        if !open[pos] {
+            let _ = fs::remove_file(temp_path).await;
+            continue;
+        }
+        if let Err(e) = fs::rename(temp_path, final_path).await {
+            failed.push((*i, e.to_string()));
+            note_failure(stats, *i, &mut written_off);
+            let _ = fs::remove_file(temp_path).await;
+            continue;
+        }
+        if preserve_mtime {
+            let path = final_path.clone();
+            let mtime = item.mtime;
+            let applied = tokio::task::spawn_blocking(move || {
+                filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0))
+            })
+            .await;
+            match applied {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failed.push((*i, e.to_string())),
+                Err(e) => failed.push((*i, e.to_string())),
+            }
+        }
+        stats.dests[*i].files.fetch_add(1, Ordering::Relaxed);
+        stats.dests[*i].bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    for i in written_off {
+        failed.push((
+            i,
+            format!("giving up on this destination after {DEST_FAILURE_LIMIT} failures"),
+        ));
+    }
+    Ok(FetchOutcome { bytes, failed })
+}
+
+/// Count a failure against a destination, noting when it is written off.
+fn note_failure(stats: &Arc<Stats>, dest: usize, written_off: &mut Vec<usize>) {
+    if stats.dests[dest].note_failure() {
+        written_off.push(dest);
+    }
 }
 
 /// How often the live counters are sampled for the timeline.
 const PROGRESS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Writer that adds each chunk to a counter as it lands.
+/// Writes each chunk to every destination, counting the bytes once.
 ///
-/// Counting on completion instead would make both the progress display and the
-/// recorded timeline move in whole-file steps, which for multi-megabyte files
-/// means minutes of apparent stillness.
-struct CountingWriter<W> {
-    inner: W,
+/// Bytes are counted as they land rather than when a file completes: counting
+/// on completion would make both the progress display and the recorded
+/// timeline move in whole-file steps, which for multi-megabyte files means
+/// minutes of apparent stillness.
+///
+/// A destination that errors is dropped from the set and its reason recorded;
+/// the remaining ones carry on. Only when every destination has gone does the
+/// write itself fail.
+///
+/// The chunk is stashed on the first call so that a `Pending` return can be
+/// resumed where it left off, since the destinations do not accept it in step.
+struct Fanout {
+    files: Vec<Option<fs::File>>,
+    failures: Vec<(usize, String)>,
+    pending: Vec<u8>,
+    at: usize,
+    off: usize,
     counter: Arc<AtomicU64>,
     written: u64,
 }
 
-impl<W> CountingWriter<W> {
-    fn new(inner: W, counter: Arc<AtomicU64>) -> Self {
+impl Fanout {
+    fn new(files: Vec<Option<fs::File>>, counter: Arc<AtomicU64>) -> Self {
         Self {
-            inner,
+            files,
+            failures: Vec::new(),
+            pending: Vec::new(),
+            at: 0,
+            off: 0,
             counter,
             written: 0,
         }
@@ -479,26 +683,96 @@ impl<W> CountingWriter<W> {
     fn written(&self) -> u64 {
         self.written
     }
+
+    fn all_closed(&self) -> bool {
+        self.files.iter().all(Option::is_none)
+    }
+
+    fn fail(&mut self, pos: usize, message: String) {
+        self.files[pos] = None;
+        self.failures.push((pos, message));
+    }
+
+    /// Which destinations are still open, and why the others are not.
+    fn finish(self) -> (Vec<bool>, Vec<(usize, String)>) {
+        (
+            self.files.iter().map(Option::is_some).collect(),
+            self.failures,
+        )
+    }
+
+    fn gone() -> std::io::Error {
+        std::io::Error::other("every destination failed")
+    }
 }
 
-impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingWriter<W> {
+impl tokio::io::AsyncWrite for Fanout {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let written = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
-        self.counter.fetch_add(written as u64, Ordering::Relaxed);
-        self.written += written as u64;
-        Poll::Ready(Ok(written))
+        let this = &mut *self;
+        if this.pending.is_empty() {
+            this.pending.extend_from_slice(data);
+            this.at = 0;
+            this.off = 0;
+        }
+
+        while this.at < this.files.len() {
+            let pos = this.at;
+            if this.files[pos].is_none() || this.off >= this.pending.len() {
+                this.at += 1;
+                this.off = 0;
+                continue;
+            }
+            let outcome = {
+                let chunk = &this.pending[this.off..];
+                let file = this.files[pos].as_mut().expect("checked just above");
+                Pin::new(file).poll_write(cx, chunk)
+            };
+            match outcome {
+                Poll::Ready(Ok(0)) => this.fail(pos, "write returned zero bytes".to_string()),
+                Poll::Ready(Ok(n)) => this.off += n,
+                Poll::Ready(Err(e)) => this.fail(pos, e.to_string()),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if this.all_closed() {
+            return Poll::Ready(Err(Self::gone()));
+        }
+        let n = this.pending.len();
+        this.pending.clear();
+        this.counter.fetch_add(n as u64, Ordering::Relaxed);
+        this.written += n as u64;
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let this = &mut *self;
+        for pos in 0..this.files.len() {
+            if this.files[pos].is_none() {
+                continue;
+            }
+            let outcome = {
+                let file = this.files[pos].as_mut().expect("checked just above");
+                Pin::new(file).poll_flush(cx)
+            };
+            match outcome {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => this.fail(pos, e.to_string()),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if this.all_closed() {
+            return Poll::Ready(Err(Self::gone()));
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        self.as_mut().poll_flush(cx)
     }
 }
 
@@ -765,6 +1039,7 @@ mod tests {
             streams: 8,
             samples: Vec::new(),
             progress: Vec::new(),
+            dests: Vec::new(),
         };
         // 80 files * 100 ms / 8 streams = 1 s of the 10 s wall clock.
         assert_eq!(report.fixed_wall_cost(), Some(Duration::from_secs(1)));
@@ -785,6 +1060,7 @@ mod tests {
             streams: 8,
             samples: Vec::new(),
             progress: Vec::new(),
+            dests: Vec::new(),
         };
         assert!(report.fixed_wall_cost().is_none());
         assert!(report.overhead_fraction().is_none());

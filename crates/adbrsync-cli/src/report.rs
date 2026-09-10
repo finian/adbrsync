@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use adbrsync_core::plan::{Plan, Reason};
 use adbrsync_core::scan::RemoteScan;
 use adbrsync_core::transfer::TransferReport;
@@ -32,14 +34,42 @@ impl Printer {
             remote.entries.len(),
             remote.root
         );
-        println!(
-            "{} to transfer ({}), {} unchanged, {} filtered, {} to delete",
-            plan.transfers.len(),
-            human_bytes(plan.total_bytes, self.human),
-            plan.unchanged,
-            plan.filtered,
-            plan.deletions.len()
-        );
+
+        // With one destination there is nothing to disambiguate, so keep the
+        // familiar single line.
+        if plan.dests.len() <= 1 {
+            let dest = plan.dests.first();
+            println!(
+                "{} to transfer ({}), {} unchanged, {} filtered, {} to delete",
+                plan.transfers.len(),
+                human_bytes(plan.total_bytes, self.human),
+                dest.map(|d| d.unchanged).unwrap_or(0),
+                plan.filtered,
+                dest.map(|d| d.deletions.len()).unwrap_or(0),
+            );
+        } else {
+            // The headline is what comes off the device, since that is the
+            // scarce resource; each destination's own share follows.
+            println!(
+                "{} files to read from the device ({}), {} unchanged everywhere, {} filtered",
+                plan.transfers.len(),
+                human_bytes(plan.total_bytes, self.human),
+                plan.unchanged_everywhere(),
+                plan.filtered,
+            );
+            for (i, dest) in plan.dests.iter().enumerate() {
+                println!(
+                    "  [{}] {:<30} {} files, {}, {} unchanged, {} to delete",
+                    i + 1,
+                    shorten(&dest.root),
+                    dest.files,
+                    human_bytes(dest.bytes, self.human),
+                    dest.unchanged,
+                    dest.deletions.len(),
+                );
+            }
+        }
+
         if plan.symlinks_skipped > 0 {
             println!(
                 "{} symlinks skipped (not reproduced in this version)",
@@ -48,10 +78,11 @@ impl Printer {
         }
     }
 
-    pub fn transfer_list(&self, plan: &Plan) {
+    pub fn transfer_list(&self, plan: &Plan, dests: &[std::path::PathBuf]) {
         if self.quiet {
             return;
         }
+        let many = dests.len() > 1;
         for item in &plan.transfers {
             let reason = match plan.reasons.get(&item.rel) {
                 Some(Reason::Missing) => "new",
@@ -60,8 +91,15 @@ impl Printer {
                 Some(Reason::ContentDiffers) => "hash",
                 None => "?",
             };
+            // Only name the destinations when there is a choice to report.
+            let targets = if many {
+                let list: Vec<String> = item.targets.iter().map(|i| (i + 1).to_string()).collect();
+                format!("  -> {}", list.join(","))
+            } else {
+                String::new()
+            };
             println!(
-                "  {reason:<5} {:>10}  {}",
+                "  {reason:<5} {:>10}  {}{targets}",
                 human_bytes(item.size, self.human),
                 item.rel
             );
@@ -77,6 +115,22 @@ impl Printer {
                 report.elapsed.as_secs_f64(),
                 human_bytes(report.throughput() as u64, self.human)
             );
+            if report.dests.len() > 1 {
+                for (i, dest) in report.dests.iter().enumerate() {
+                    let failures = if dest.failures > 0 {
+                        format!("  ({} failed)", dest.failures)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  [{}] {:<30} {} files, {}{failures}",
+                        i + 1,
+                        shorten(&dest.root),
+                        dest.files,
+                        human_bytes(dest.bytes, self.human),
+                    );
+                }
+            }
         }
         if stats {
             println!("stats:");
@@ -122,6 +176,23 @@ impl Printer {
     }
 }
 
+/// Keep a destination readable in a column without losing which one it is.
+fn shorten(path: &Path) -> String {
+    let full = path.display().to_string();
+    if full.chars().count() <= 30 {
+        return full;
+    }
+    let tail: String = full
+        .chars()
+        .rev()
+        .take(27)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("...{tail}")
+}
+
 /// Format a byte count, either exactly or scaled for humans.
 pub fn human_bytes(bytes: u64, human: bool) -> String {
     if !human {
@@ -155,5 +226,19 @@ mod tests {
         assert_eq!(human_bytes(512, true), "512B");
         assert_eq!(human_bytes(1536, true), "1.50K");
         assert_eq!(human_bytes(5 * 1024 * 1024, true), "5.00M");
+    }
+
+    #[test]
+    fn short_paths_are_left_alone() {
+        assert_eq!(shorten(Path::new("/Volumes/M1")), "/Volumes/M1");
+    }
+
+    #[test]
+    fn long_paths_keep_their_tail() {
+        let long = Path::new("/Volumes/Backup/2026/september/phone/DCIM/Camera");
+        let out = shorten(long);
+        assert!(out.starts_with("..."), "{out}");
+        assert!(out.ends_with("Camera"), "{out}");
+        assert_eq!(out.chars().count(), 30);
     }
 }

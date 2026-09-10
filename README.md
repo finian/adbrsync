@@ -49,7 +49,12 @@ adbrsync [OPTIONS] SRC DEST
 `SRC` names a device path as `device:/path` (any single connected device) or
 `<serial>:/path`. `DEST` is a local directory. A trailing slash on `SRC` copies
 the directory's contents; without one the directory itself is created inside
-`DEST` — the same rule as rsync.
+`DEST` — the same rule as rsync. A single file as `SRC` always lands inside
+`DEST` under its own name.
+
+Give more than one destination and the pull is written to all of them from a
+single read of the device. Note this is the mirror image of rsync, which takes
+many sources and one destination.
 
 ```sh
 # Mirror the camera roll, removing local files that are gone from the device
@@ -64,7 +69,41 @@ adbrsync -av --exclude '*.tmp' --exclude 'Android/data/**' \
 
 # Raise concurrency and show progress
 adbrsync -a --streams 24 --progress --stats device:/sdcard/Pictures/ ./backup/
+
+# Two backup drives, filled from one pass over the device
+adbrsync -av device:/sdcard/DCIM/ /Volumes/M1/DCIM/ /Volumes/M2/DCIM/
 ```
+
+## Several destinations at once
+
+The device link is the slow part of a backup — an order of magnitude slower than
+a local disk — so once the bytes have been read, writing them a second time is
+nearly free. Pulling to two drives takes about as long as pulling to one.
+
+Each destination is compared against the device separately, and deliberately so.
+Diffing only against the first and letting the others take whatever it needed
+would be a little simpler, but any destination that fell behind — a run
+interrupted partway, a write that failed, a file removed by hand — would stay
+behind for good, with nothing to notice. Comparing each one means every run
+repairs whatever has drifted, and it costs almost nothing because the scans run
+concurrently. A file only one destination is missing is read once and written
+only there.
+
+Destinations are kept independent while the run is going:
+
+- **A destination is never created implicitly.** An unmounted drive leaves an
+  empty mount point behind, and writing there fills the internal disk while
+  looking like a successful backup. Pass `--mkpath` to create one on purpose,
+  or `--skip-missing-dest` to carry on without it — for a set of drives that
+  are not all attached at once, so the ones that are present still get their
+  backup. Either way the run exits 23 to say it did less than it was asked.
+- **One failing destination does not take the others down.** A drive that is
+  full, read-only or unplugged is reported and dropped; the rest of the run
+  finishes, and the exit code says the run was partial. After ten failures a
+  destination is written off for the remainder of the run rather than repeating
+  the same error for every file.
+- Two destinations that name the same directory, or one inside another, are
+  refused: their writes and their `--delete` passes would fight each other.
 
 ## rsync compatibility
 
@@ -88,7 +127,8 @@ recognised.
 device.
 
 Additional options: `--streams N` (concurrent sync streams, default 16),
-`--server ADDR`, `--mtime-tolerance SECONDS`, `--perf-report FILE`.
+`--mkpath`, `--skip-missing-dest`, `--server ADDR`, `--mtime-tolerance SECONDS`,
+`--perf-report FILE`.
 
 Note that `-h` is human-readable output, as in rsync; use `--help` for usage.
 

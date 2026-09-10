@@ -3,19 +3,20 @@ mod info;
 mod progress;
 mod report;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use adb_proto::{shell, AdbClient, DeviceSelector};
 use adbrsync_core::perf::{DeviceFacts, OptionFacts, PerfReport, PhaseMillis};
+use adbrsync_core::plan::DestState;
 use adbrsync_core::{
-    checksum, plan, scan, transfer, Digests, Filter, PlanOptions, TransferOptions,
+    checksum, plan, scan, transfer, Digests, Filter, LocalEntry, PlanOptions, TransferOptions,
 };
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use crate::args::{parse_remote, parse_size, Args};
+use crate::args::{parse_remote, parse_size, Args, RemoteSpec};
 use crate::info::{InfoFlags, ParseOutcome};
 use crate::report::Printer;
 
@@ -71,6 +72,96 @@ fn resolve_info(args: &Args, printer: &Printer) -> Option<InfoFlags> {
     }
 }
 
+/// Check the destinations and work out where the files actually land.
+///
+/// A destination is never created implicitly. On removable media an unmounted
+/// drive leaves an empty mount point behind, and a backup written there fills
+/// the internal disk while reporting success — the failure looks exactly like a
+/// good run until the day the copy is needed.
+fn resolve_destinations(
+    args: &Args,
+    source: &RemoteSpec,
+    source_is_file: bool,
+) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let mut roots = Vec::with_capacity(args.dests.len());
+    let mut missing = Vec::new();
+
+    for raw in &args.dests {
+        if parse_remote(raw).is_some() {
+            bail!("destination {raw:?} looks like a device path; this version only pulls");
+        }
+        let given = PathBuf::from(raw);
+        match std::fs::metadata(&given) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => bail!("destination {raw:?} exists but is not a directory"),
+            Err(_) if args.mkpath => std::fs::create_dir_all(&given)
+                .with_context(|| format!("cannot create destination {raw}"))?,
+            Err(_) => {
+                missing.push(raw.clone());
+                continue;
+            }
+        }
+        roots.push(given);
+    }
+
+    if !missing.is_empty() && !args.skip_missing_dest {
+        bail!(
+            "destination does not exist: {}\n\
+             A destination is never created implicitly. If this is a removable drive, \
+             check that it is mounted: an unmounted drive leaves an empty mount point, \
+             and writing there fills the internal disk instead. Pass --mkpath to create \
+             it, or --skip-missing-dest to go ahead without it.",
+            missing.join(", ")
+        );
+    }
+    if roots.is_empty() {
+        bail!("none of the destinations exist: {}", args.dests.join(", "));
+    }
+
+    // Two destinations that are the same directory, or one inside another,
+    // would have the writes and the --delete pass fighting each other.
+    let canonical: Vec<PathBuf> = roots
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+    for (i, a) in canonical.iter().enumerate() {
+        for (j, b) in canonical.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if a == b {
+                bail!(
+                    "destinations {} and {} are the same directory",
+                    i + 1,
+                    j + 1
+                );
+            }
+            if a.starts_with(b) {
+                bail!(
+                    "destination {} ({}) is inside destination {} ({})",
+                    i + 1,
+                    a.display(),
+                    j + 1,
+                    b.display()
+                );
+            }
+        }
+    }
+
+    // rsync's trailing-slash rule: without one, the source directory itself is
+    // recreated inside each destination. A single file is the exception: it
+    // always lands *in* the destination directory under its own name, so the
+    // caller passes the directory either way.
+    if !source.trailing_slash && !source_is_file {
+        if let Some(name) = source.path.rsplit('/').next().filter(|n| !n.is_empty()) {
+            for root in &mut roots {
+                root.push(name);
+            }
+        }
+    }
+    Ok((roots, missing))
+}
+
 async fn run(args: Args) -> Result<i32> {
     let total_started = Instant::now();
     let printer = Printer::new(args.quiet, args.human_readable);
@@ -105,17 +196,27 @@ async fn run(args: Args) -> Result<i32> {
             args.src
         )
     })?;
-    if parse_remote(&args.dest).is_some() {
-        bail!("destination must be a local path; this version only pulls from the device");
-    }
-
-    // rsync's trailing-slash rule: without one, the source directory itself is
-    // recreated inside the destination.
-    let mut dest = PathBuf::from(&args.dest);
-    if !source.trailing_slash {
-        if let Some(name) = source.path.rsplit('/').next().filter(|n| !n.is_empty()) {
-            dest.push(name);
-        }
+    // One cheap round trip settles whether the source is a file, which decides
+    // where the destination paths point before any scanning starts.
+    let probe_client = AdbClient::new(args.server.clone());
+    let probe_selector = match &source.serial {
+        Some(serial) => DeviceSelector::Serial(serial.clone()),
+        None => DeviceSelector::Any,
+    };
+    let source_is_file = match adb_proto::SyncSession::open(&probe_client, &probe_selector).await {
+        Ok(mut sync) => sync
+            .stat(&source.path)
+            .await
+            .map(|st| st.is_file())
+            .unwrap_or(false),
+        // A device we cannot reach is reported properly a few lines below.
+        Err(_) => false,
+    };
+    let (dests, skipped) = resolve_destinations(&args, &source, source_is_file)?;
+    for name in &skipped {
+        printer.warn(&format!(
+            "{name}: does not exist; skipped (--skip-missing-dest)"
+        ));
     }
 
     let recursive = args.recursive || args.archive;
@@ -157,14 +258,26 @@ async fn run(args: Args) -> Result<i32> {
         ..Default::default()
     };
 
-    // Both trees are walked at once; neither blocks the other.
+    // The device walk and every local walk run at once. The destinations are
+    // separate devices, so scanning all of them costs about what scanning one
+    // does — which is what makes diffing each destination affordable.
     let phase = Instant::now();
     let remote_scan = scan::scan_remote(&client, &selector, &source.path);
-    let dest_for_scan = dest.clone();
-    let local_scan = tokio::task::spawn_blocking(move || scan::scan_local(&dest_for_scan));
-    let (remote, local) = tokio::join!(remote_scan, local_scan);
-    let mut remote = remote.context("device scan failed")?;
-    let local = local.expect("local scan task")?;
+    let local_scans: Vec<_> = dests
+        .iter()
+        .cloned()
+        .map(|root| tokio::task::spawn_blocking(move || scan::scan_local(&root)))
+        .collect();
+    let remote = remote_scan.await.context("device scan failed")?;
+    let mut locals: Vec<Vec<LocalEntry>> = Vec::with_capacity(dests.len());
+    for (i, task) in local_scans.into_iter().enumerate() {
+        let scanned = task
+            .await
+            .expect("local scan task")
+            .with_context(|| format!("cannot scan destination {}", dests[i].display()))?;
+        locals.push(scanned);
+    }
+    let mut remote = remote;
     phases.scan_remote = phase.elapsed().as_millis();
 
     if !recursive {
@@ -186,27 +299,36 @@ async fn run(args: Args) -> Result<i32> {
     };
 
     let phase = Instant::now();
-    let digests = if args.checksum {
+    let digests: Vec<Digests> = if args.checksum {
         printer.info("hashing files present on both sides");
-        checksum::compare(&client, &selector, &remote.entries, &local, &dest)
+        checksum::compare_many(&client, &selector, &remote.entries, &dests, &locals)
             .await
             .context("checksum comparison failed")?
     } else {
-        Digests::default()
+        dests.iter().map(|_| Digests::default()).collect()
     };
     phases.checksum = phase.elapsed().as_millis();
 
     let phase = Instant::now();
-    let plan = plan::build(&remote, &local, &dest, &filter, &opts, &digests);
+    let states: Vec<DestState> = dests
+        .iter()
+        .zip(locals.iter())
+        .zip(digests.iter())
+        .map(|((root, local), digests)| DestState {
+            root: root.as_path(),
+            local,
+            digests,
+        })
+        .collect();
+    let plan = plan::build(&remote, &states, &filter, &opts);
+    drop(states);
     phases.plan = phase.elapsed().as_millis();
 
     printer.plan_summary(&remote, &plan);
 
-    // A run that transfers nothing still measured a scan, and that is often the
-    // slow part; write the report rather than silently skipping it.
     if args.dry_run || plan.is_empty() {
         if args.dry_run && info.wants_names() {
-            printer.transfer_list(&plan);
+            printer.transfer_list(&plan, &dests);
         }
         phases.total = total_started.elapsed().as_millis();
         write_perf_report(
@@ -214,7 +336,7 @@ async fn run(args: Args) -> Result<i32> {
             &client,
             &selector,
             &device,
-            &dest,
+            &dests,
             &excludes,
             recursive,
             args.streams.max(1),
@@ -230,20 +352,27 @@ async fn run(args: Args) -> Result<i32> {
         } else {
             "nothing to do"
         });
-        return Ok(0);
+        return Ok(if skipped.is_empty() { 0 } else { EXIT_PARTIAL });
     }
 
+    let stats = Arc::new(transfer::Stats::new(dests.len()));
+
     let phase = Instant::now();
-    transfer::create_dirs(&plan, &dest)
+    let unprepared = transfer::create_dirs(&plan, &dests)
         .await
         .context("cannot create destination directories")?;
+    for (i, message) in &unprepared {
+        printer.warn(&format!(
+            "{}: cannot be written ({message}); continuing without it",
+            dests[*i].display()
+        ));
+        stats.dests[*i].disable();
+    }
     phases.create_dirs = phase.elapsed().as_millis();
 
     if info.wants_names() {
-        printer.transfer_list(&plan);
+        printer.transfer_list(&plan, &dests);
     }
-
-    let stats = Arc::new(transfer::Stats::default());
     let progress_task = info
         .wants_progress()
         .then(|| progress::spawn(Arc::clone(&stats)));
@@ -253,10 +382,16 @@ async fn run(args: Args) -> Result<i32> {
         preserve_mtime: args.times || args.archive,
     };
     let phase = Instant::now();
-    let mut transfer_report =
-        transfer::run(&client, &selector, &plan, &dest, &topts, Arc::clone(&stats))
-            .await
-            .context("transfer failed")?;
+    let mut transfer_report = transfer::run(
+        &client,
+        &selector,
+        &plan,
+        &dests,
+        &topts,
+        Arc::clone(&stats),
+    )
+    .await
+    .context("transfer failed")?;
     phases.transfer = phase.elapsed().as_millis();
 
     if let Some(handle) = progress_task {
@@ -264,15 +399,35 @@ async fn run(args: Args) -> Result<i32> {
         progress::clear();
     }
 
+    // A destination that was skipped or never got off the ground still has to
+    // make the run count as a partial one, or the exit code would call it a
+    // success.
+    for name in &skipped {
+        transfer_report.errors.push(transfer::FileError {
+            rel: name.clone(),
+            message: "destination does not exist; skipped".to_string(),
+        });
+    }
+    for (i, message) in &unprepared {
+        transfer_report.errors.push(transfer::FileError {
+            rel: dests[i.to_owned()].display().to_string(),
+            message: message.clone(),
+        });
+    }
+
     let phase = Instant::now();
-    if !plan.deletions.is_empty() {
-        let errors = transfer::apply_deletions(&plan.deletions).await;
+    for (i, dest) in plan.dests.iter().enumerate() {
+        if dest.deletions.is_empty() {
+            continue;
+        }
+        let errors = transfer::apply_deletions(&dest.deletions).await;
         for e in &errors {
             printer.warn(&format!("cannot delete {}: {}", e.rel, e.message));
         }
         printer.info(&format!(
-            "deleted {} extraneous entries",
-            plan.deletions.len()
+            "{}: deleted {} extraneous entries",
+            dests[i].display(),
+            dest.deletions.len() - errors.len()
         ));
         transfer_report.errors.extend(errors);
     }
@@ -286,7 +441,7 @@ async fn run(args: Args) -> Result<i32> {
         &client,
         &selector,
         &device,
-        &dest,
+        &dests,
         &excludes,
         recursive,
         topts.streams,
@@ -312,7 +467,7 @@ async fn write_perf_report(
     client: &AdbClient,
     selector: &DeviceSelector,
     device: &adb_proto::DeviceInfo,
-    dest: &std::path::Path,
+    dests: &[PathBuf],
     excludes: &[String],
     recursive: bool,
     streams: usize,
@@ -337,7 +492,7 @@ async fn write_perf_report(
     };
     let report = PerfReport::build(
         &args.src,
-        dest,
+        dests,
         device_facts(client, selector, device).await,
         options,
         phases,
@@ -345,9 +500,9 @@ async fn write_perf_report(
         plan,
         transfer_report,
     );
-    let path = PathBuf::from(path);
+    let path = Path::new(path);
     report
-        .write_to(&path)
+        .write_to(path)
         .with_context(|| format!("cannot write performance report to {}", path.display()))?;
     printer.info(&format!("performance report written to {}", path.display()));
     Ok(())

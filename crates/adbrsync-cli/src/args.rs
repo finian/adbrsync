@@ -19,8 +19,15 @@ pub struct Args {
     /// directory itself is created inside DEST, exactly as in rsync.
     pub src: String,
 
-    /// Local destination directory.
-    pub dest: String,
+    /// Local destination directories.
+    ///
+    /// Give more than one and the pull is written to all of them from a single
+    /// read of the device, which is the cheapest way to keep two backup drives
+    /// in step: the device link is the slow part, and a second local write is
+    /// nearly free. Each destination is compared separately, so one that has
+    /// fallen behind is repaired rather than left behind.
+    #[arg(required = true, num_args = 1..)]
+    pub dests: Vec<String>,
 
     /// Archive mode. On Android this means `-rt` plus symlink handling where
     /// the filesystem supports it; see the notes below.
@@ -112,6 +119,23 @@ pub struct Args {
     /// Output sizes in a human readable form.
     #[arg(short = 'h', long = "human-readable")]
     pub human_readable: bool,
+
+    /// Create a destination directory that does not exist.
+    ///
+    /// Off by default on purpose: an unmounted drive leaves an empty mount
+    /// point behind, and writing there fills the internal disk while looking
+    /// like a successful backup.
+    #[arg(long = "mkpath")]
+    pub mkpath: bool,
+
+    /// Carry on when a destination does not exist, instead of refusing to run.
+    ///
+    /// For a set of drives that are not all attached at once: the ones that are
+    /// present get their backup, the missing ones are reported, and the run
+    /// exits 23 to say it was partial. Without this a missing destination stops
+    /// everything, on the grounds that it is usually a mistake.
+    #[arg(long = "skip-missing-dest")]
+    pub skip_missing_dest: bool,
 
     /// Number of concurrent sync streams.
     ///

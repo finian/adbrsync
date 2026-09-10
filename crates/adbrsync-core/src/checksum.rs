@@ -26,30 +26,45 @@ impl Digests {
 /// here where the size is known rather than delegated to the device.
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 
-/// Compare device and local files by content rather than size and mtime.
+/// Compare device and local files by content rather than size and mtime, for
+/// every destination at once.
 ///
-/// Only files present on both sides are considered; anything missing locally is
-/// going to be transferred regardless.
-pub async fn compare(
+/// The device side is hashed once for the union of candidates, however many
+/// destinations there are: re-reading a phone's storage per destination is the
+/// one cost worth avoiding here, since the link is the scarce resource. Local
+/// hashing then happens per destination, which is cheap and parallel.
+pub async fn compare_many(
     client: &AdbClient,
     selector: &DeviceSelector,
     remote: &[RemoteEntry],
-    local: &[LocalEntry],
-    dest: &Path,
-) -> Result<Digests> {
-    let local_by_rel: HashMap<&str, &LocalEntry> = local
+    roots: &[std::path::PathBuf],
+    locals: &[Vec<LocalEntry>],
+) -> Result<Vec<Digests>> {
+    let files: Vec<&RemoteEntry> = remote
         .iter()
         .filter(|e| e.kind == EntryKind::File)
-        .map(|e| (e.rel.as_str(), e))
         .collect();
 
-    let candidates: Vec<&RemoteEntry> = remote
+    let present: Vec<HashMap<&str, &LocalEntry>> = locals
         .iter()
-        .filter(|e| e.kind == EntryKind::File)
-        .filter(|e| local_by_rel.contains_key(e.rel.as_str()))
+        .map(|local| {
+            local
+                .iter()
+                .filter(|e| e.kind == EntryKind::File)
+                .map(|e| (e.rel.as_str(), e))
+                .collect()
+        })
+        .collect();
+
+    // Only files that exist somewhere are worth hashing; anything missing
+    // everywhere is going to be transferred regardless.
+    let candidates: Vec<&RemoteEntry> = files
+        .iter()
+        .copied()
+        .filter(|e| present.iter().any(|p| p.contains_key(e.rel.as_str())))
         .collect();
     if candidates.is_empty() {
-        return Ok(Digests::default());
+        return Ok(roots.iter().map(|_| Digests::default()).collect());
     }
 
     let remote_digests = device_digests(
@@ -62,34 +77,39 @@ pub async fn compare(
     )
     .await?;
 
-    let paths: Vec<(String, std::path::PathBuf)> = candidates
-        .iter()
-        .filter_map(|e| crate::entry::safe_join(dest, &e.rel).map(|p| (e.remote.clone(), p)))
-        .collect();
-    let local_digests = tokio::task::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .filter_map(|(key, path)| local_digest(&path).ok().map(|d| (key, d)))
-            .collect::<HashMap<String, String>>()
-    })
-    .await
-    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let mut out = Vec::with_capacity(roots.len());
+    for (i, root) in roots.iter().enumerate() {
+        let paths: Vec<(String, std::path::PathBuf)> = candidates
+            .iter()
+            .filter(|e| present[i].contains_key(e.rel.as_str()))
+            .filter_map(|e| crate::entry::safe_join(root, &e.rel).map(|p| (e.remote.clone(), p)))
+            .collect();
+        let local_digests = tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .filter_map(|(key, path)| local_digest(&path).ok().map(|d| (key, d)))
+                .collect::<HashMap<String, String>>()
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
 
-    let mut matched = HashSet::new();
-    for entry in candidates {
-        let (Some(a), Some(b)) = (
-            remote_digests.get(&entry.remote),
-            local_digests.get(&entry.remote),
-        ) else {
-            // A digest we could not obtain means "assume different", which
-            // costs a transfer but never silently keeps a stale file.
-            continue;
-        };
-        if a == b {
-            matched.insert(entry.rel.clone());
+        let mut matched = HashSet::new();
+        for entry in &candidates {
+            let (Some(a), Some(b)) = (
+                remote_digests.get(&entry.remote),
+                local_digests.get(&entry.remote),
+            ) else {
+                // A digest we could not obtain means "assume different", which
+                // costs a transfer but never silently keeps a stale file.
+                continue;
+            };
+            if a == b {
+                matched.insert(entry.rel.clone());
+            }
         }
+        out.push(Digests { matched });
     }
-    Ok(Digests { matched })
+    Ok(out)
 }
 
 /// Hash files on the device, batched into commands of a bounded size.

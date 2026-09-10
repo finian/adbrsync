@@ -72,12 +72,27 @@ pub struct SourceFacts {
 
 #[derive(Debug, Default, Serialize)]
 pub struct PlanFacts {
+    /// Files to read from the device. One read may serve several destinations.
     pub transfers: usize,
+    /// Bytes to read from the device, counting each file once.
     pub bytes: u64,
-    pub unchanged: usize,
     pub filtered: usize,
-    pub deletions: usize,
     pub symlinks_skipped: usize,
+    pub unchanged_everywhere: usize,
+    pub destinations: Vec<DestFacts>,
+}
+
+/// What one destination was due to receive, and what it actually got.
+#[derive(Debug, Default, Serialize)]
+pub struct DestFacts {
+    pub root: String,
+    pub planned_files: usize,
+    pub planned_bytes: u64,
+    pub unchanged: usize,
+    pub deletions: usize,
+    pub written_files: u64,
+    pub written_bytes: u64,
+    pub failures: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -154,7 +169,7 @@ pub struct PerfReport {
     pub tool_version: &'static str,
     pub started_at_unix: u64,
     pub source_path: String,
-    pub dest_path: String,
+    pub dest_paths: Vec<String>,
     pub device: DeviceFacts,
     pub options: OptionFacts,
     pub phases_ms: PhaseMillis,
@@ -175,7 +190,7 @@ impl PerfReport {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         source_path: &str,
-        dest: &Path,
+        dests: &[std::path::PathBuf],
         device: DeviceFacts,
         options: OptionFacts,
         phases_ms: PhaseMillis,
@@ -213,7 +228,7 @@ impl PerfReport {
             tool_version: env!("CARGO_PKG_VERSION"),
             started_at_unix: unix_now(),
             source_path: source_path.to_string(),
-            dest_path: dest.display().to_string(),
+            dest_paths: dests.iter().map(|d| d.display().to_string()).collect(),
             device,
             options,
             phases_ms,
@@ -221,10 +236,27 @@ impl PerfReport {
             plan: PlanFacts {
                 transfers: plan.transfers.len(),
                 bytes: plan.total_bytes,
-                unchanged: plan.unchanged,
                 filtered: plan.filtered,
-                deletions: plan.deletions.len(),
                 symlinks_skipped: plan.symlinks_skipped,
+                unchanged_everywhere: plan.unchanged_everywhere(),
+                destinations: plan
+                    .dests
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let got = report.dests.get(i);
+                        DestFacts {
+                            root: d.root.display().to_string(),
+                            planned_files: d.files,
+                            planned_bytes: d.bytes,
+                            unchanged: d.unchanged,
+                            deletions: d.deletions.len(),
+                            written_files: got.map(|o| o.files).unwrap_or(0),
+                            written_bytes: got.map(|o| o.bytes).unwrap_or(0),
+                            failures: got.map(|o| o.failures).unwrap_or(0),
+                        }
+                    })
+                    .collect(),
             },
             transfer,
             size_buckets: bucketize(&report.samples),

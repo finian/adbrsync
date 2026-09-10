@@ -79,11 +79,32 @@ pub async fn scan_remote(
         }
     }
 
+    // A single file as the source resolves to itself, which would otherwise
+    // land as the root entry with an empty relative path and be skipped as
+    // "the directory itself". Name it after the file so it is transferred like
+    // any other, into the destination directory.
+    if entries.len() == 1 {
+        let only = &mut entries[0];
+        if only.kind == EntryKind::File && only.rel.is_empty() {
+            only.rel = only
+                .remote
+                .rsplit('/')
+                .next()
+                .unwrap_or(only.remote.as_str())
+                .to_string();
+        }
+    }
+
     Ok(RemoteScan {
         root: resolved,
         entries,
         denied,
     })
+}
+
+/// Whether a scan turned out to be one file rather than a tree.
+pub fn is_single_file(scan: &RemoteScan) -> bool {
+    scan.entries.len() == 1 && scan.entries[0].kind == EntryKind::File
 }
 
 fn walk_command(root: &str) -> String {
@@ -270,6 +291,25 @@ mod tests {
             strip_find_prefix("find: '/storage/emulated/0/Android/data': Permission denied"),
             "/storage/emulated/0/Android/data"
         );
+    }
+
+    #[test]
+    fn a_single_file_source_is_named_after_the_file() {
+        // `find` on a file prints the file itself, which strip_prefix would
+        // reduce to an empty relative path.
+        let e = parse_record(
+            "f|1234|1700000000|644|/storage/emulated/0/DCIM/a.jpg",
+            "/storage/emulated/0/DCIM/a.jpg",
+        )
+        .unwrap();
+        assert_eq!(e.rel, "");
+
+        let scan = RemoteScan {
+            root: "/storage/emulated/0/DCIM/a.jpg".into(),
+            entries: vec![e],
+            denied: vec![],
+        };
+        assert!(is_single_file(&scan));
     }
 
     #[test]
