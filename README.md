@@ -198,6 +198,31 @@ the same concurrency — where per-file cost is negligible by construction —
 managed 12.86 MB/s. Fifty times as many files, and throughput did not drop:
 per-file overhead is fully hidden behind concurrency on a link this speed.
 
+## Reproducing the measurements
+
+Every figure above came from `scripts/bench.sh`, which runs one unattended pass
+and leaves a directory of results:
+
+```sh
+scripts/bench.sh              # roughly 12-20 minutes at the defaults
+scripts/bench.sh --help       # what it measures and what you can change
+```
+
+It builds its own corpora on the device, sweeps `--streams`, measures small
+files against large ones, and scans the real tree — without transferring it — to
+project the answer onto data you actually have. Then it removes everything it
+created, on the device and locally, including on interrupt.
+
+It needs only `adb` and an `adbrsync` binary, no Rust toolchain, so it can be
+copied to whichever machine has the device attached. The stream count it
+repeats at both ends of the sweep is a drift control: if those two runs
+disagree, page cache or thermal throttling contaminated the numbers between
+them and the sweep should be rerun.
+
+Numbers that depend on the link do not carry between links. Measured on the
+reference device, one stream reaches 84% of the peak over USB but only 41% over
+wi-fi, which is why the default is worth rechecking rather than assuming.
+
 ## Scope
 
 v0.1 pulls from the device. Pushing, the delta algorithm, and Linux host
