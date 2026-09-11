@@ -162,6 +162,43 @@ fn resolve_destinations(
     Ok((roots, missing))
 }
 
+/// What one cheap round trip says about the source path.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceProbe {
+    /// The device answered and the path is not there.
+    Missing,
+    File,
+    /// A directory, or a device we could not reach: the scan settles it.
+    Other,
+}
+
+/// "No such file or directory", as the sync service reports it.
+const ENOENT: u32 = 2;
+
+async fn probe_source(client: &AdbClient, selector: &DeviceSelector, path: &str) -> SourceProbe {
+    // A stat that fails for any reason other than a plain absence is left to
+    // the scan, which reports it in the device's own words.
+    let Ok(mut sync) = adb_proto::SyncSession::open(client, selector).await else {
+        return SourceProbe::Other;
+    };
+    let Ok(stat) = sync.stat(path).await else {
+        return SourceProbe::Other;
+    };
+    classify(&stat)
+}
+
+fn classify(stat: &adb_proto::SyncStat) -> SourceProbe {
+    // Older sync services answer a missing path with a zero mode instead of an
+    // errno, so both shapes count as absent.
+    if stat.error == ENOENT || (stat.error == 0 && stat.mode == 0) {
+        SourceProbe::Missing
+    } else if stat.is_file() {
+        SourceProbe::File
+    } else {
+        SourceProbe::Other
+    }
+}
+
 async fn run(args: Args) -> Result<i32> {
     let total_started = Instant::now();
     let printer = Printer::new(args.quiet, args.human_readable);
@@ -196,29 +233,6 @@ async fn run(args: Args) -> Result<i32> {
             args.src
         )
     })?;
-    // One cheap round trip settles whether the source is a file, which decides
-    // where the destination paths point before any scanning starts.
-    let probe_client = AdbClient::new(args.server.clone());
-    let probe_selector = match &source.serial {
-        Some(serial) => DeviceSelector::Serial(serial.clone()),
-        None => DeviceSelector::Any,
-    };
-    let source_is_file = match adb_proto::SyncSession::open(&probe_client, &probe_selector).await {
-        Ok(mut sync) => sync
-            .stat(&source.path)
-            .await
-            .map(|st| st.is_file())
-            .unwrap_or(false),
-        // A device we cannot reach is reported properly a few lines below.
-        Err(_) => false,
-    };
-    let (dests, skipped) = resolve_destinations(&args, &source, source_is_file)?;
-    for name in &skipped {
-        printer.warn(&format!(
-            "{name}: does not exist; skipped (--skip-missing-dest)"
-        ));
-    }
-
     let recursive = args.recursive || args.archive;
     let mut excludes = args.exclude.clone();
     if let Some(path) = &args.exclude_from {
@@ -233,6 +247,11 @@ async fn run(args: Args) -> Result<i32> {
     }
     let filter = Filter::new(&args.include, &excludes)?;
 
+    // What is checked first is what gets reported when several things are
+    // wrong at once, so the order runs from the cause that explains the most
+    // to the one that explains the least: an absent device makes the source
+    // unknowable, and an absent source makes the destinations beside the
+    // point.
     let phase = Instant::now();
     let client = AdbClient::new(args.server.clone());
     let selector = match &source.serial {
@@ -257,6 +276,20 @@ async fn run(args: Args) -> Result<i32> {
         connect: phase.elapsed().as_millis(),
         ..Default::default()
     };
+
+    // One cheap round trip settles whether the source is a file, which decides
+    // where the destination paths point before any scanning starts.
+    let probe = probe_source(&client, &selector, &source.path).await;
+    if matches!(probe, SourceProbe::Missing) {
+        bail!("source does not exist on the device: {}", source.path);
+    }
+    let (dests, skipped) =
+        resolve_destinations(&args, &source, matches!(probe, SourceProbe::File))?;
+    for name in &skipped {
+        printer.warn(&format!(
+            "{name}: does not exist; skipped (--skip-missing-dest)"
+        ));
+    }
 
     // The device walk and every local walk run at once. The destinations are
     // separate devices, so scanning all of them costs about what scanning one
@@ -541,5 +574,47 @@ async fn device_facts(
             .await
             .map(|f| f.into_iter().collect())
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adb_proto::SyncStat;
+
+    #[test]
+    fn absent_paths_are_recognised() {
+        let enoent = SyncStat {
+            error: ENOENT,
+            ..Default::default()
+        };
+        assert_eq!(classify(&enoent), SourceProbe::Missing);
+        // The older answer: no errno, no mode.
+        assert_eq!(classify(&SyncStat::default()), SourceProbe::Missing);
+    }
+
+    #[test]
+    fn files_and_directories_are_told_apart() {
+        let file = SyncStat {
+            mode: 0o100644,
+            ..Default::default()
+        };
+        let dir = SyncStat {
+            mode: 0o040755,
+            ..Default::default()
+        };
+        assert_eq!(classify(&file), SourceProbe::File);
+        assert_eq!(classify(&dir), SourceProbe::Other);
+    }
+
+    #[test]
+    fn other_errors_are_left_to_the_scan() {
+        // EACCES: the path may well exist, so do not claim otherwise.
+        let denied = SyncStat {
+            error: 13,
+            mode: 0o040755,
+            ..Default::default()
+        };
+        assert_eq!(classify(&denied), SourceProbe::Other);
     }
 }
