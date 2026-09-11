@@ -201,7 +201,7 @@ fn classify(stat: &adb_proto::SyncStat) -> SourceProbe {
 
 async fn run(args: Args) -> Result<i32> {
     let total_started = Instant::now();
-    let printer = Printer::new(args.quiet, args.human_readable);
+    let printer = Printer::new(args.quiet, args.verbose > 0, args.human_readable);
     let Some(info) = resolve_info(&args, &printer) else {
         return Ok(0); // --info=help
     };
@@ -265,7 +265,7 @@ async fn run(args: Args) -> Result<i32> {
     if !device.is_usable() {
         bail!("device {} is in state {}", device.serial, device.state);
     }
-    printer.info(&format!(
+    printer.detail(&format!(
         "connected to {} ({})",
         device.serial,
         device.model.as_deref().unwrap_or("unknown model")

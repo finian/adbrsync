@@ -7,16 +7,30 @@ use adbrsync_core::transfer::TransferReport;
 /// Console output, gated on verbosity.
 pub struct Printer {
     quiet: bool,
+    verbose: bool,
     human: bool,
 }
 
 impl Printer {
-    pub fn new(quiet: bool, human: bool) -> Self {
-        Self { quiet, human }
+    pub fn new(quiet: bool, verbose: bool, human: bool) -> Self {
+        Self {
+            quiet,
+            verbose,
+            human,
+        }
     }
 
     pub fn info(&self, msg: &str) {
         if !self.quiet {
+            println!("{msg}");
+        }
+    }
+
+    /// Background the user did not ask for. It prints only under -v, so that
+    /// an error stands alone instead of trailing a line about something that
+    /// worked.
+    pub fn detail(&self, msg: &str) {
+        if self.verbose && !self.quiet {
             println!("{msg}");
         }
     }
