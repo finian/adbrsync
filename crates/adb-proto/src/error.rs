@@ -38,7 +38,7 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("more than one device connected; specify one with --serial ({0})")]
+    #[error("more than one device connected ({0}); name one as <serial>:/path")]
     AmbiguousDevice(DeviceList),
 }
 
@@ -48,8 +48,25 @@ pub struct DeviceList(pub Vec<String>);
 
 impl fmt::Display for DeviceList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // An empty list is the common case when a serial is mistyped and
+        // nothing is plugged in; a bare trailing colon reads like the message
+        // was cut off.
+        if self.0.is_empty() {
+            return f.write_str("none");
+        }
         f.write_str(&self.0.join(", "))
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_device_list_says_none() {
+        assert_eq!(DeviceList(Vec::new()).to_string(), "none");
+        assert_eq!(DeviceList(vec!["a".into(), "b".into()]).to_string(), "a, b");
+    }
+}
